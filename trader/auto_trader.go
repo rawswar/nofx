@@ -9,6 +9,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"nofx/db"
 	"nofx/decision"
 	"nofx/featureflag"
 	"nofx/logger"
@@ -78,17 +79,21 @@ type AutoTrader struct {
 	riskEngine            *risk.Engine
 	riskStore             *risk.Store
 	featureFlags          *featureflag.RuntimeFlags
+	persistStore          *db.RiskStore
 	stateMu               sync.RWMutex
 	mutexEnabledCache     atomic.Bool
 	mutexDisabledCache    atomic.Bool
 	initialBalance        float64
 	dailyPnL              float64
+	currentBalance        float64
+	peakBalance           float64
 	lastResetTime         time.Time
 	stopUntil             time.Time
 	isRunning             bool
 	startTime             time.Time        // 系统启动时间
 	callCount             int              // AI调用次数
 	positionFirstSeenTime map[string]int64 // 持仓首次出现时间 (symbol_side -> timestamp毫秒)
+	persistenceCloseOnce  sync.Once
 }
 
 // NewAutoTrader 创建自动交易器
@@ -213,8 +218,125 @@ func NewAutoTrader(config AutoTraderConfig, store *risk.Store, flags *featurefla
 	return at, nil
 }
 
+// NewAutoTraderWithPersistence creates an AutoTrader with database persistence
+// enabled. When enable_persistence is true, the trader restores risk state from
+// the database and hooks persistence callbacks. Database failures are logged but
+// never fatal, preserving the trading loop's reliability.
+func NewAutoTraderWithPersistence(cfg AutoTraderConfig, dbPath string, flags *featureflag.RuntimeFlags) (*AutoTrader, error) {
+	runtimeFlags := flags
+	if cfg.FeatureFlags != nil {
+		runtimeFlags = cfg.FeatureFlags
+	}
+	if runtimeFlags == nil {
+		runtimeFlags = featureflag.NewRuntimeFlags(featureflag.DefaultState())
+	}
+
+	usePersistence := runtimeFlags.PersistenceEnabled() && strings.TrimSpace(dbPath) != ""
+
+	var store *risk.Store
+	if usePersistence {
+		store = risk.NewStore()
+	}
+
+	at, err := NewAutoTrader(cfg, store, runtimeFlags)
+	if err != nil {
+		return nil, err
+	}
+
+	if !usePersistence {
+		log.Printf("🔧 [%s] Persistence disabled; running in-memory only", cfg.Name)
+		return at, nil
+	}
+
+	persistStore, err := db.NewRiskStore(dbPath)
+	if err != nil {
+		log.Printf("⚠️  [%s] Failed to initialize persistence: %v; proceeding without it", cfg.Name, err)
+		return at, nil
+	}
+
+	persistStore.BindTrader(cfg.ID)
+	at.persistStore = persistStore
+
+	persistFunc := func(traderID string, snapshot risk.Snapshot) error {
+		if at.persistStore == nil {
+			return nil
+		}
+		state := &db.RiskState{
+			TraderID:      traderID,
+			DailyPnL:      snapshot.DailyPnL,
+			DrawdownPct:   snapshot.DrawdownPct,
+			CurrentEquity: snapshot.CurrentEquity,
+			PeakEquity:    snapshot.PeakEquity,
+			TradingPaused: snapshot.TradingPaused,
+			PausedUntil:   snapshot.PausedUntil,
+			LastResetTime: snapshot.LastReset,
+			UpdatedAt:     time.Now(),
+		}
+		return at.persistStore.Save(state, "", "risk_snapshot")
+	}
+
+	if at.riskStore != nil {
+		at.riskStore.SetPersistFunc(persistFunc)
+	}
+
+	if state, err := persistStore.Load(); err != nil {
+		log.Printf("⚠️  [%s] Failed to load persisted risk state: %v", cfg.Name, err)
+	} else if state != nil {
+		at.restorePersistedState(state)
+		persistFunc(at.id, at.riskEngine.Snapshot())
+	}
+
+	return at, nil
+}
+
+func (at *AutoTrader) restorePersistedState(state *db.RiskState) {
+	if state == nil || at.riskEngine == nil {
+		return
+	}
+
+	snapshot := at.riskEngine.Snapshot()
+	delta := state.DailyPnL - snapshot.DailyPnL
+	if delta != 0 {
+		at.riskEngine.UpdateDailyPnL(delta)
+	}
+
+	if state.PeakEquity > 0 {
+		at.riskEngine.RecordEquity(state.PeakEquity)
+	}
+	if state.CurrentEquity > 0 {
+		at.riskEngine.RecordEquity(state.CurrentEquity)
+	}
+
+	at.setDailyPnL(state.DailyPnL)
+	if !state.LastResetTime.IsZero() {
+		at.SetLastResetTime(state.LastResetTime)
+	}
+	at.SetStopUntil(state.PausedUntil)
+	at.setPeakBalance(state.PeakEquity)
+	at.setCurrentBalance(state.CurrentEquity)
+
+	if state.TradingPaused {
+		at.riskStore.SetTradingPaused(at.id, true, state.PausedUntil, at.featureFlags)
+	}
+
+	if state.TradingPaused && !state.PausedUntil.IsZero() && time.Now().Before(state.PausedUntil) {
+		log.Printf("⏸  [%s] Trading paused until %s due to restored risk state", at.name, state.PausedUntil.Format(time.RFC3339))
+	}
+}
+
+// ClosePersistence gracefully shuts down the persistence worker. Must be called
+// during graceful shutdown to drain pending writes.
+func (at *AutoTrader) ClosePersistence() {
+	at.persistenceCloseOnce.Do(func() {
+		if at.persistStore != nil {
+			at.persistStore.Close()
+		}
+	})
+}
+
 // Run 运行自动交易主循环
 func (at *AutoTrader) Run() error {
+	defer at.ClosePersistence()
 	at.SetTrading(true)
 	log.Println("🚀 AI驱动自动交易系统启动")
 	log.Printf("💰 初始余额: %.2f USDT", at.initialBalance)
@@ -330,24 +452,21 @@ func (at *AutoTrader) runCycle() error {
 	log.Printf("📊 账户净值: %.2f USDT | 可用: %.2f USDT | 持仓: %d",
 		ctx.Account.TotalEquity, ctx.Account.AvailableBalance, ctx.Account.PositionCount)
 
-	if at.riskEngine != nil {
-		riskDecision := at.riskEngine.Assess(ctx.Account.TotalEquity)
-		at.setDailyPnL(riskDecision.DailyPnL)
-		at.SetStopUntil(riskDecision.PausedUntil)
-		if riskDecision.Breached && !riskDecision.TradingPaused && riskDecision.Reason != "" {
-			log.Printf("⚠️ 风险限制触发: %s", riskDecision.Reason)
+	at.setCurrentBalance(ctx.Account.TotalEquity)
+	if ctx.Account.TotalEquity > at.peakBalanceSnapshot() {
+		at.setPeakBalance(ctx.Account.TotalEquity)
+	}
+
+	canTrade, reason := at.CanTrade()
+	if !canTrade {
+		if reason == "" {
+			reason = "风险控制暂停中"
 		}
-		if riskDecision.TradingPaused {
-			reason := riskDecision.Reason
-			if reason == "" {
-				reason = "风险控制暂停中"
-			}
-			log.Printf("⏸ 风险控制触发：%s", reason)
-			record.Success = false
-			record.ErrorMessage = reason
-			at.decisionLogger.LogDecision(record)
-			return nil
-		}
+		log.Printf("⏸ 风险控制触发：%s", reason)
+		record.Success = false
+		record.ErrorMessage = reason
+		at.decisionLogger.LogDecision(record)
+		return nil
 	}
 
 	// 4. 调用AI获取完整决策
@@ -1044,6 +1163,122 @@ func (at *AutoTrader) setDailyPnL(value float64) {
 	at.stateMu.Lock()
 	at.dailyPnL = value
 	at.stateMu.Unlock()
+}
+
+func (at *AutoTrader) setCurrentBalance(value float64) {
+	if at == nil {
+		return
+	}
+
+	if at.mutexProtectionDisabled() {
+		at.currentBalance = value
+		return
+	}
+
+	at.stateMu.Lock()
+	at.currentBalance = value
+	at.stateMu.Unlock()
+}
+
+func (at *AutoTrader) currentBalanceSnapshot() float64 {
+	if at == nil {
+		return 0
+	}
+
+	if at.mutexProtectionDisabled() {
+		return at.currentBalance
+	}
+
+	at.stateMu.RLock()
+	defer at.stateMu.RUnlock()
+	return at.currentBalance
+}
+
+func (at *AutoTrader) setPeakBalance(value float64) {
+	if at == nil {
+		return
+	}
+
+	if at.mutexProtectionDisabled() {
+		at.peakBalance = value
+		return
+	}
+
+	at.stateMu.Lock()
+	at.peakBalance = value
+	at.stateMu.Unlock()
+}
+
+func (at *AutoTrader) peakBalanceSnapshot() float64 {
+	if at == nil {
+		return 0
+	}
+
+	if at.mutexProtectionDisabled() {
+		return at.peakBalance
+	}
+
+	at.stateMu.RLock()
+	defer at.stateMu.RUnlock()
+	return at.peakBalance
+}
+
+// CanTrade evaluates whether the trader is allowed to execute trades at the
+// present moment. It enforces stop-until windows and consults the risk engine
+// when risk enforcement is enabled. On breach it logs an explicit warning.
+func (at *AutoTrader) CanTrade() (bool, string) {
+	if at == nil {
+		return false, "auto trader not initialized"
+	}
+
+	now := time.Now()
+	stopUntil := at.GetStopUntil()
+	if !stopUntil.IsZero() && now.Before(stopUntil) {
+		remaining := stopUntil.Sub(now)
+		if remaining < 0 {
+			remaining = 0
+		}
+		return false, fmt.Sprintf("风险控制暂停中，剩余 %.0f 分钟", remaining.Minutes())
+	}
+
+	if at.riskEngine == nil {
+		return true, ""
+	}
+
+	if at.featureFlags != nil && !at.featureFlags.RiskEnforcementEnabled() {
+		return true, ""
+	}
+
+	equity := at.currentBalanceSnapshot()
+	if equity <= 0 {
+		return true, ""
+	}
+
+	decision := at.riskEngine.Assess(equity)
+	at.setDailyPnL(decision.DailyPnL)
+	at.SetStopUntil(decision.PausedUntil)
+
+	snapshot := at.riskEngine.Snapshot()
+	at.setCurrentBalance(snapshot.CurrentEquity)
+	at.setPeakBalance(snapshot.PeakEquity)
+
+	if decision.Breached {
+		reason := decision.Reason
+		if reason == "" {
+			reason = "risk limit breached"
+		}
+		log.Printf("RISK LIMIT BREACHED [%s]: %s", at.name, reason)
+	}
+
+	if decision.TradingPaused {
+		reason := decision.Reason
+		if reason == "" {
+			reason = "风险控制暂停中"
+		}
+		return false, reason
+	}
+
+	return true, ""
 }
 
 // UpdateDailyPnL applies a delta to the tracked daily PnL. The helper is safe
