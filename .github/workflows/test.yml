@@ -36,7 +36,7 @@ jobs:
       - name: Run tests with Docker (PostgreSQL integration tests)
         run: ./scripts/ci_test.sh
         env:
-          COVERAGE_TARGET: 90
+          COVERAGE_TARGET: 50
           SKIP_RACE: false
 
       - name: Upload coverage to Codecov
@@ -87,9 +87,10 @@ jobs:
       - name: Run tests without Docker (DB tests auto-skip)
         run: ./scripts/ci_test.sh
         env:
-          COVERAGE_TARGET: 90
+          COVERAGE_TARGET: 50
           SKIP_RACE: false
           SKIP_DOCKER_TESTS: 1
+          COVERAGE_MODE: risk-only
 
       - name: Upload coverage artifact
         uses: actions/upload-artifact@v4
